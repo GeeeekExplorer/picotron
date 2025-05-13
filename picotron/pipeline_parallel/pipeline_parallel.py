@@ -94,13 +94,15 @@ def train_step_pipeline_afab(model, data_loader, tensor_shapes, device, dtype):
     for _ in range(data_loader.grad_acc_steps): # All forward passes
         input_tensor = pipeline_communicate(operation='recv_forward', shapes=tensor_shapes, device=device, dtype=dtype)
         batch = next(data_loader)
-        batch["hidden_states"] = input_tensor.to(device) if input_tensor is not None else input_tensor
-        output_tensor = model.forward(input_ids=batch["input_ids"].to(device), position_ids=batch["position_ids"].to(device), hidden_states=batch["hidden_states"])
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        position_ids = batch["position_ids"].to(device, non_blocking=True)
+        output_tensor = model.forward(input_ids=input_ids, position_ids=position_ids, hidden_states=input_tensor)
         pipeline_communicate(operation='send_forward', tensor=output_tensor, device=device, dtype=dtype)
-        
+
         # calculate loss on the last stage
         if pgm.process_group_manager.pp_is_last_stage:
-            output_tensor = F.cross_entropy(output_tensor.transpose(1, 2), batch["target_ids"].to(device), reduction='mean')
+            target_ids = batch["target_ids"].to(device, non_blocking=True)
+            output_tensor = F.cross_entropy(output_tensor.flatten(0, 1), target_ids.flatten(), reduction='mean')
             logging_loss += output_tensor.item() / data_loader.grad_acc_steps
 
         # Save tensors to reconstruct computation graph during backward pass
@@ -141,16 +143,18 @@ def train_step_pipeline_1f1b(model, data_loader, tensor_shapes, device, dtype):
     num_microbatches_remaining = data_loader.grad_acc_steps - num_warmup_microbatches
     logging_loss, input_tensors, output_tensors  = 0.0, [], []
     requires_grad_sync = pgm.process_group_manager.cp_dp_world_size > 1
-    
+
     def _forward_step(input_tensor):
         """Helper function to perform a single forward step in the pipeline."""
         batch = next(data_loader)
-        batch["hidden_states"] = input_tensor.to(device) if input_tensor is not None else input_tensor
-        output_tensor = model.forward(input_ids=batch["input_ids"].to(device), position_ids=batch["position_ids"].to(device), hidden_states=batch["hidden_states"])
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        position_ids = batch["position_ids"].to(device, non_blocking=True)
+        output_tensor = model.forward(input_ids=input_ids, position_ids=position_ids, hidden_states=input_tensor)
         
         # calculate loss on the last stage
         if pgm.process_group_manager.pp_is_last_stage:
-            output_tensor = F.cross_entropy(output_tensor.transpose(1, 2), batch["target_ids"].to(device), reduction='mean')
+            target_ids = batch["target_ids"].to(device, non_blocking=True)
+            output_tensor = F.cross_entropy(output_tensor.flatten(0, 1), target_ids.flatten(), reduction='mean')
             nonlocal logging_loss
             logging_loss += output_tensor.item() / data_loader.grad_acc_steps
         return output_tensor
